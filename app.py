@@ -15,9 +15,7 @@ from core.theme import apply_theme
 from core.ui_components import header, render_map, weather_summary
 from core.weather import fetch_current_temp, fetch_design_tmin, geocode_list
 
-# --------------------------
 # Page config
-# --------------------------
 st.set_page_config(
     page_title="SANAD — PV Design Intake",
     page_icon="SANAD",
@@ -28,14 +26,13 @@ st.set_page_config(
 apply_theme()
 init_state()
 
-# IMPORTANT: make stage persistent (won't override if already set)
+# IMPORTANT
 st.session_state.setdefault("stage", 1)
 
 header("SANAD")
 
 
 def status_badge(level: str) -> str:
-    # Uses your CSS badges if موجودة
     if level == "PASS":
         return '<span class="sg-chip">MATCH</span>'
     if level == "WARN":
@@ -55,15 +52,11 @@ def level_to_streamlit(level: str):
     return st.info
 
 
-# ==========================
-# STAGE 1 — Intake
-# ==========================
+
 if st.session_state["stage"] == 1:
     left, right = st.columns([1.05, 0.95], gap="large")
 
-    # ==========================
-    # LEFT — Site selection
-    # ==========================
+ 
     with left:
         st.markdown('<div class="sg-h2">Site selection</div>', unsafe_allow_html=True)
 
@@ -172,9 +165,9 @@ if st.session_state["stage"] == 1:
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # ==========================
-    # RIGHT — Inputs + Weather
-    # ==========================
+   
+    # Inputs + Weather
+    
     with right:
         st.markdown('<div class="sg-h2">Input documents</div>', unsafe_allow_html=True)
 
@@ -229,10 +222,6 @@ if st.session_state["stage"] == 1:
             st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
-
-# ==================================================
-# STAGE 2 — Engineering Review
-# ==================================================
 
 elif st.session_state["stage"] == 2:
     from core.stage2 import render_stage2
