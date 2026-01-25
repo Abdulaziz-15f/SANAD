@@ -30,7 +30,7 @@ def render_map(
 
     tip = label or "Selected site"
 
-    # ===== square boundary (engineering style) =====
+   
     d = 0.08  # size of square (visual only)
 
     folium.Rectangle(
@@ -46,7 +46,6 @@ def render_map(
         tooltip=tip,
     ).add_to(m)
 
-    # ===== precise center point =====
     folium.CircleMarker(
         location=[lat, lon],
         radius=6,
