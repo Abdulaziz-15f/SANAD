@@ -1,5 +1,7 @@
+from typing import Optional
 import folium
 import streamlit.components.v1 as components
+
 
 import streamlit as st
 
@@ -61,35 +63,57 @@ def render_map(
     components.html(html, height=height, scrolling=False)
 
 
-def weather_summary(place, current_temp, tmin, method):
-    place_txt = place or "—"
-    ct = "—" if current_temp is None else f"{float(current_temp):.1f}"
-    tm = "—" if tmin is None else f"{float(tmin):.0f}"
+def weather_summary(
+    place: Optional[str],
+    current_temp: Optional[float],
+    tmin: Optional[float],
+    tmin_method: Optional[str],
+    tmax: Optional[float] = None,
+    max_wind_speed: Optional[float] = None,
+    current_wind_speed: Optional[float] = None,
+) -> None:
+    """Render weather summary card with all climate data."""
+    import streamlit as st
 
     st.markdown(
-        f"""
-        <div class="sg-weather">
-          <div class="sg-weather-top">
-            <div>
-              <div class="sg-label">Current temperature</div>
-              <div class="sg-temp">{ct}<span class="sg-unit">°C</span></div>
+        """
+        <div class="sg-card">
+            <div class="sg-card-title">Current temperature</div>
+            <div class="sg-card-value">{curr_temp} <span class="sg-card-unit">°C</span></div>
+            <div style="display: flex; justify-content: space-between; margin-top: 1rem;">
+                <div>
+                    <div class="sg-card-subtitle">Lowest (10Y)</div>
+                    <div class="sg-card-value-sm">{tmin} <span class="sg-card-unit">°C</span></div>
+                </div>
+                <div>
+                    <div class="sg-card-subtitle">Highest (10Y)</div>
+                    <div class="sg-card-value-sm">{tmax} <span class="sg-card-unit">°C</span></div>
+                </div>
             </div>
-            <div style="text-align:right;">
-              <div class="sg-label">Lowest temperature last 10Y</div>
-              <div class="sg-temp">{tm}<span class="sg-unit">°C</span></div>
+            <div style="display: flex; justify-content: space-between; margin-top: 1rem;">
+                <div>
+                    <div class="sg-card-subtitle">Current wind</div>
+                    <div class="sg-card-value-sm">{curr_wind} <span class="sg-card-unit">km/h</span></div>
+                </div>
+                <div>
+                    <div class="sg-card-subtitle">Max wind gust (10Y)</div>
+                    <div class="sg-card-value-sm">{max_wind} <span class="sg-card-unit">km/h</span></div>
+                </div>
             </div>
-          </div>
-
-          <div style="margin-top:10px; color: rgba(255,255,255,0.72); font-size:0.88rem; line-height:1.4;">
-            <div><b>Site:</b> {place_txt}</div>
-            <div style="margin-top:6px;"><span class="sg-chip">{method or "—"}</span></div>
-          </div>
+            <div class="sg-card-footer">
+                <div><b>Site:</b> {place}</div>
+                <div class="sg-badge">{method}</div>
+            </div>
         </div>
-
-
-
-
-        """,
+        """.format(
+            curr_temp=f"{current_temp:.1f}" if current_temp is not None else "—",
+            tmin=f"{tmin:.1f}" if tmin is not None else "—",
+            tmax=f"{tmax:.1f}" if tmax is not None else "—",
+            curr_wind=f"{current_wind_speed:.1f}" if current_wind_speed is not None else "—",
+            max_wind=f"{max_wind_speed:.1f}" if max_wind_speed is not None else "—",
+            place=place or "Not selected",
+            method=tmin_method or "",
+        ),
         unsafe_allow_html=True,
     )
 

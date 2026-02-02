@@ -1,287 +1,300 @@
+from __future__ import annotations
+
+import hashlib
+import io
+from typing import Any, Dict, Optional
+
 import streamlit as st
+
 from core.report import generate_sanad_report, now_date_str
+from core.parsers.bom_signals import extract_bom_signals
 from core.review import (
-    climate_voltage_check,
     compare_bom_vs_sld,
-    extract_bom_signals,
+    climate_voltage_check,
     saudi_standards_snapshot,
-    try_extract_from_sld,
+    run_ac_voltage_drop_review,
 )
-
-def _inject_css():
-    st.markdown(
-        """
-<style>
-/* Title + divider spacing */
-.stage2-title{
-  font-weight: 950;
-  font-size: 1.18rem;
-  margin: 0.2rem 0 0.7rem 0;
-  letter-spacing: -0.01em;
-}
-
-/* Card */
-.sg-card2{
-  border-radius: 18px;
-  padding: 14px 14px;
-  margin: 0 0 14px 0;
-  border: 1px solid rgba(255,255,255,0.14);
-  background: rgba(18, 28, 26, 0.62);
-  box-shadow: 0 14px 34px rgba(0,0,0,0.35);
-}
-.sg-card2.ok{ border-color: rgba(46,196,182,0.55); background: rgba(46,196,182,0.075); }
-.sg-card2.warn{ border-color: rgba(255,183,3,0.55); background: rgba(255,183,3,0.075); }
-.sg-card2.crit{ border-color: rgba(230,57,70,0.55); background: rgba(230,57,70,0.075); }
-
-/* Badge (one only) */
-.badge{
-  display:inline-flex;
-  align-items:center;
-  padding: 6px 12px;
-  border-radius: 999px;
-  font-weight: 950;
-  font-size: .78rem;
-  letter-spacing: .08em;
-  border: 1px solid rgba(255,255,255,0.18);
-  background: rgba(255,255,255,0.06);
-  color: rgba(233,255,250,0.92);
-}
-.badge.ok{ border-color: rgba(46,196,182,0.55); }
-.badge.warn{ border-color: rgba(255,183,3,0.55); }
-.badge.crit{ border-color: rgba(230,57,70,0.55); }
-
-/* Subtitle */
-.sub{
-  font-size: .90rem;
-  color: rgba(233,255,250,0.72);
-  margin-top: 2px;
-  line-height: 1.35;
-}
-
-/* Bullets */
-.bullets{
-  margin-top: 10px;
-  padding: 10px 12px;
-  border-radius: 14px;
-  border: 1px solid rgba(255,255,255,0.10);
-  background: rgba(255,255,255,0.04);
-}
-.bullets .item{
-  margin: 6px 0;
-  font-size: .93rem;
-  color: rgba(233,255,250,0.88);
-  line-height: 1.35;
-}
-
-/* KPI */
-.kpi-box{
-  border-radius: 16px;
-  padding: 12px 12px;
-  border: 1px solid rgba(255,255,255,0.12);
-  background: rgba(255,255,255,0.06);
-}
-.kpi-k{
-  font-size:.76rem;
-  color: rgba(233,255,250,0.60);
-  text-transform: uppercase;
-  letter-spacing:.06em;
-}
-.kpi-v{
-  margin-top:4px;
-  font-size:1.15rem;
-  font-weight:950;
-  color: rgba(233,255,250,0.96);
-}
-
-/* Section spacing */
-.section-gap{ height: 8px; }
-</style>
-        """,
-        unsafe_allow_html=True,
-    )
+from core.extract.sld_extract import extract_sld_signals_from_pdf
 
 
-def _level_class(level: str) -> str:
-    level = (level or "WARN").upper()
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+def _status_to_streamlit(level: str):
+    """Maps internal check levels to Streamlit alert components."""
     if level == "PASS":
-        return "ok"
+        return st.success
     if level == "WARN":
-        return "warn"
+        return st.warning
     if level == "FAIL":
-        return "crit"
-    return "warn"
+        return st.error
+    return st.info
 
 
-def _badge_text(level: str) -> str:
-    level = (level or "WARN").upper()
-    if level == "PASS":
-        return "MATCH"
-    if level == "WARN":
-        return "WARNING"
-    if level == "FAIL":
-        return "CRITICAL"
-    return ""
+def _sha256(data: bytes) -> str:
+    """Stable hash used to cache OCR results for the same uploaded PDF."""
+    return hashlib.sha256(data).hexdigest()
 
 
-def _clean_lines(lines):
-    out = []
-    for x in lines or []:
-        s = str(x).strip()
-        if not s:
-            continue
-        if s.lower() in ("</div>", "<div>", "</span>", "<span>"):
-            continue
-        if s.startswith("<") and s.endswith(">"):
-            continue
-        out.append(s)
-    return out
+def _run_sld_ocr_all_pages(pdf_bytes: bytes) -> Dict[str, Any]:
+    """
+    Runs OCR across all PDF pages (best accuracy for scanned SLDs).
+    Uses a progress callback to keep the UI responsive.
 
+    Notes:
+      - We avoid st.cache_data here because we want live progress updates.
+      - Caching is handled in session_state by PDF hash in render_stage2().
+    """
+    bar = st.progress(0, text="Starting OCR…")
 
-def render_card(title, subtitle, level, bullets):
-    cls = _level_class(level)
-    badge = _badge_text(level)
+    def progress_cb(done: int, total: int):
+        pct = int((done / max(total, 1)) * 100)
+        bar.progress(pct, text=f"OCR running… page {done}/{total}")
 
-    st.markdown(f'<div class="sg-card2 {cls}">', unsafe_allow_html=True)
-
-    topL, topR = st.columns([1.35, 0.65])
-    with topL:
-        st.markdown(f"**{title}**")
-        st.markdown(f'<div class="sub">{subtitle}</div>', unsafe_allow_html=True)
-
-    with topR:
-        if badge:
-            st.markdown(
-                f'<div class="badge {cls}">{badge}</div>', unsafe_allow_html=True
-            )
-
-    bullets = _clean_lines(bullets) or ["—"]
-
-    st.markdown('<div class="bullets">', unsafe_allow_html=True)
-    for b in bullets:
-        st.markdown(f'<div class="item">• {b}</div>', unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-def render_kpis(items):
-    cols = st.columns(len(items))
-    for c, (k, v) in zip(cols, items):
-        with c:
-            st.markdown(
-                f"""
-                <div class="kpi-box">
-                  <div class="kpi-k">{k}</div>
-                  <div class="kpi-v">{v}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-
-
-def render_stage2():
-    _inject_css()
-
-    st.markdown(
-        '<div class="stage2-title">Engineering review</div>', unsafe_allow_html=True
-    )
-    st.markdown('<div class="sg-divider"></div>', unsafe_allow_html=True)
-
-    bom_df = st.session_state.get("bom_df")
-    sld_bytes = st.session_state.get("sld_pdf_bytes")
-    tmin = st.session_state.get("tmin")
-
-    if bom_df is None or sld_bytes is None or tmin is None:
-        st.error("Missing inputs. Complete Stage 1 first.")
-        return
-
-    # signals
-    bom_sig = extract_bom_signals(bom_df)
-    sld_sig = try_extract_from_sld(sld_bytes)
-
-    # 1) BoM vs SLD
-    doc = compare_bom_vs_sld(bom_sig, sld_sig)
-
-    # per your requirement: INFO -> treat as PASS
-    doc_level = (doc.level or "PASS").upper()
-    if doc_level == "INFO":
-        doc_level = "PASS"
-
-    render_card(
-        title="BoM vs SLD consistency",
-        subtitle="Verifies whether the SLD drawing aligns with BoM key electrical values.",
-        level=doc_level,
-        bullets=doc.details,
+    res = extract_sld_signals_from_pdf(
+        pdf_bytes,
+        target_dpi=300,
+        progress_cb=progress_cb,
     )
 
-    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+    bar.empty()
 
-    # 2) Climate check
-    climate, numbers, recs = climate_voltage_check(bom_sig, float(tmin))
-
-    render_kpis(
-        [
-            ("Inverter DC max", f"{numbers['Inverter_DC_max_V']:.0f} V"),
-            ("Modules / string", f"{numbers['Modules_per_string']}"),
-            ("Lowest temp (10y)", f"{numbers['Tmin_C']:.0f} °C"),
-            ("String Voc @ Tmin", f"{numbers['String_Voc_at_Tmin_V']:.0f} V"),
-        ]
-    )
-
-    render_card(
-        title="Cold weather overvoltage risk",
-        subtitle="Checks PV string voltage at minimum historical temperature.",
-        level=climate.level,
-        bullets=(climate.details + (recs or [])),
-    )
-
-    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
-
-    # 3) Standards snapshot
-    compliant, gaps = saudi_standards_snapshot(
-        climate_ok=(climate.level == "PASS"),
-        bom_sld_level=doc_level,
-    )
-
-    c1, c2 = st.columns([1, 1], gap="large")
-    with c1:
-        render_card(
-            title="Saudi / IEC snapshot — covered",
-            subtitle="Checks satisfied in current submission.",
-            level="PASS",
-            bullets=compliant,
-        )
-    with c2:
-        render_card(
-            title="Saudi / IEC snapshot — gaps",
-            subtitle="Items requiring attention before approval.",
-            level=("WARN" if gaps else "PASS"),
-            bullets=(gaps or ["No outstanding gaps detected."]),
-        )
-
-    # 4) Export
-    st.markdown('<div class="sg-divider"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="stage2-title">Export report</div>', unsafe_allow_html=True)
-
-    payload = {
-        "project_name": "SANAD",
-        "place": st.session_state.get("place", "-"),
-        "date_str": now_date_str(),
-        "numbers": numbers,
-        "bom_status": doc_level,
-        "climate_status": climate.level,
-        "compliant": compliant,
-        "gaps": gaps,
-        "recommendations": (recs or []),
+    # Normalize into the shape expected by compare/check functions.
+    return {
+        "inverter_vmax": res.inverter_vmax,
+        "modules_per_string": res.modules_per_string,
+        "inverter_labels": getattr(res, "inverter_labels", []),
+        "notes": res.notes,
+        "evidence": res.evidence,
     }
 
-    pdf = generate_sanad_report(payload)
+
+# -------------------------------------------------------------------
+# Stage 2: Engineering Review + Report Export
+# -------------------------------------------------------------------
+def render_stage2() -> None:
+    """
+    Stage 2: Runs engineering checks and generates the final report.
+    Inputs are expected to be present in st.session_state from Stage 1.
+    """
+
+    st.markdown('<div class="sg-h2">Engineering Review</div>', unsafe_allow_html=True)
+
+    # ----------------------------
+    # Load inputs from session state
+    # ----------------------------
+    place = st.session_state.get("place")
+    lat = st.session_state.get("lat")
+    lon = st.session_state.get("lon")
+    tmin = st.session_state.get("tmin")
+
+    sld_pdf_bytes: Optional[bytes] = st.session_state.get("sld_pdf_bytes")
+    bom_df = st.session_state.get("bom_df")
+
+    ac_cable_bytes: Optional[bytes] = st.session_state.get("ac_cable_bytes")
+    ac_cable_name: Optional[str] = st.session_state.get("ac_cable_name")
+
+    # Defensive guard (Stage 1 should already prevent reaching Stage 2 without these)
+    if not all(
+        [
+            place,
+            lat is not None,
+            lon is not None,
+            tmin is not None,
+            sld_pdf_bytes,
+            bom_df is not None,
+            ac_cable_bytes,  # required
+        ]
+    ):
+        st.error("Missing inputs. Go back to Stage 1 and upload the required files.")
+        return
+
+    # ----------------------------
+    # 1) Extract BoM signals
+    # ----------------------------
+    bom_sig = extract_bom_signals(bom_df)
+
+    # ----------------------------
+    # 2) Extract SLD signals (OCR all pages) with manual caching
+    # ----------------------------
+    st.markdown('<div class="sg-h2">SLD Extraction</div>', unsafe_allow_html=True)
+
+    sld_hash = _sha256(sld_pdf_bytes)
+    cached = st.session_state.get("sld_sig_cache")
+
+    if (
+        isinstance(cached, dict)
+        and cached.get("hash") == sld_hash
+        and isinstance(cached.get("data"), dict)
+    ):
+        sld_sig = cached["data"]
+        st.success("Using cached SLD OCR results (no re-run).")
+    else:
+        st.info("Running OCR on all SLD pages for maximum extraction accuracy…")
+        sld_sig = _run_sld_ocr_all_pages(sld_pdf_bytes)
+        st.session_state["sld_sig_cache"] = {"hash": sld_hash, "data": sld_sig}
+        st.success("SLD OCR finished.")
+
+    # Quick visibility of extracted values
+    c1, c2 = st.columns(2)
+    with c1:
+        st.write(f"- **Detected inverter DC max (SLD)**: {sld_sig.get('inverter_vmax')}")
+        st.write(f"- **Detected modules/string (SLD)**: {sld_sig.get('modules_per_string')}")
+    with c2:
+        st.write(f"- **Notes**: {sld_sig.get('notes')}")
+        inv_labels = sld_sig.get("inverter_labels") or []
+        if inv_labels:
+            st.write(f"- **Inverter labels detected**: {len(inv_labels)} (e.g., {', '.join(inv_labels[:5])})")
+
+    # Evidence is useful for debugging OCR extraction and showing transparency in the report.
+    evidence = sld_sig.get("evidence") or {}
+    if evidence:
+        with st.expander("Show extraction evidence"):
+            for field, ev in evidence.items():
+                st.write(f"**{field}**")
+                st.write(f"- page: {ev.get('page')}")
+                st.write(f"- conf: {ev.get('conf')}")
+                st.write(f"- text: {ev.get('text')}")
+                st.markdown("---")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ----------------------------
+    # 3) Consistency check (BoM vs SLD)
+    # ----------------------------
+    bom_sld_status = compare_bom_vs_sld(bom_sig, sld_sig)
+
+    # ----------------------------
+    # 4) Climate / Tmin overvoltage check
+    # ----------------------------
+    climate_status, climate_numbers, climate_recs = climate_voltage_check(bom_sig, tmin)
+    climate_ok = climate_status.level == "PASS"
+
+    # ----------------------------
+    # 5) Standards snapshot (high-level list of pass/gaps)
+    # ----------------------------
+    compliant_points, gaps_points = saudi_standards_snapshot(climate_ok, bom_sld_status.level)
+
+    # ----------------------------
+    # 6) AC voltage drop check (required input)
+    # ----------------------------
+    ac_vd_result = run_ac_voltage_drop_review(
+        io.BytesIO(ac_cable_bytes),
+        inv_limit_pct=3.0,
+        comb_limit_pct=1.5,
+    )
+
+    # Store results for report export (and future UI expansions)
+    st.session_state["review_result"] = {
+        "place": place,
+        "lat": lat,
+        "lon": lon,
+        "tmin": tmin,
+        "bom_sig": bom_sig,
+        "sld_sig": sld_sig,
+        "bom_sld_status": bom_sld_status,
+        "climate_status": climate_status,
+        "climate_numbers": climate_numbers,
+        "climate_recs": climate_recs,
+        "compliant_points": compliant_points,
+        "gaps_points": gaps_points,
+        "ac_vd_result": ac_vd_result,
+        "ac_cable_name": ac_cable_name,
+        "run_date": now_date_str(),
+    }
+
+    # ----------------------------
+    # UI: KPIs
+    # ----------------------------
+    st.markdown('<div class="sg-h2">Key Results</div>', unsafe_allow_html=True)
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.metric("Site Tmin (°C)", f"{tmin:.1f}")
+    with k2:
+        st.metric("Modules/String (BoM)", str(bom_sig.get("modules_per_string")))
+    with k3:
+        st.metric("Inverter DC Max (BoM)", f"{bom_sig.get('inverter_vmax'):.0f} V")
+    with k4:
+        sld_vmax = sld_sig.get("inverter_vmax")
+        st.metric("Inverter DC Max (SLD)", f"{float(sld_vmax):.0f} V" if sld_vmax else "—")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ----------------------------
+    # UI: Checks
+    # ----------------------------
+    st.markdown('<div class="sg-h2">Checks</div>', unsafe_allow_html=True)
+
+    _status_to_streamlit(bom_sld_status.level)(bom_sld_status.title)
+    for line in bom_sld_status.details:
+        st.write(f"- {line}")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    _status_to_streamlit(climate_status.level)(climate_status.title)
+    for line in climate_status.details:
+        st.write(f"- {line}")
+
+    with st.expander("Show calculation details"):
+        for k, v in climate_numbers.items():
+            st.write(f"- **{k}**: {v}")
+
+        if climate_recs:
+            st.markdown("**Recommendations:**")
+            for r in climate_recs:
+                st.write(f"- {r}")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ----------------------------
+    # UI: AC voltage drop
+    # ----------------------------
+    st.markdown('<div class="sg-h2">AC Voltage Drop</div>', unsafe_allow_html=True)
+
+    kpis = ac_vd_result["kpis"]
+    issues = ac_vd_result["issues"]
+
+    st.write(f"- **Max inverter VD%**: {kpis['max_inverter_vd_pct']:.2f}% (limit 3.00%)")
+    st.write(f"- **Max combiner→MDB VD%**: {kpis['max_combiner_vd_pct']:.2f}% (limit 1.50%)")
+    st.write(f"- **Runs**: {kpis['inverter_runs_count']} inverter runs, {kpis['combiner_runs_count']} combiner runs")
+
+    if len(issues) == 0:
+        st.success("PASS — Voltage drop values are within limits.")
+    else:
+        st.warning(f"FOUND {len(issues)} voltage drop issues")
+        with st.expander("Show issues"):
+            for it in issues:
+                st.write(f"- **{it.severity}** — {it.title}")
+                st.caption(it.description)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ----------------------------
+    # UI: Compliance snapshot
+    # ----------------------------
+    st.markdown('<div class="sg-h2">Compliance Snapshot</div>', unsafe_allow_html=True)
+
+    with st.expander("Compliant points"):
+        for p in compliant_points:
+            st.write(f"- {p}")
+
+    with st.expander("Gaps / actions"):
+        for g in gaps_points:
+            st.write(f"- {g}")
+
+    # ----------------------------
+    # Export: PDF report
+    # ----------------------------
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown('<div class="sg-h2">Export</div>', unsafe_allow_html=True)
+
+    pdf_bytes = generate_sanad_report(st.session_state["review_result"])
 
     st.download_button(
-        "Download SANAD report (PDF)",
-        data=pdf,
-        file_name="SANAD_Design_Review_Report.pdf",
+        label="Download SANAD Report (PDF)",
+        data=pdf_bytes,
+        file_name=f"SANAD_Report_{now_date_str()}.pdf",
         mime="application/pdf",
         use_container_width=True,
     )

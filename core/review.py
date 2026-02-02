@@ -1,288 +1,315 @@
+"""
+Engineering review logic for SANAD.
+
+This module contains the check functions used by Stage 2.
+It must NOT import streamlit at module level or call st.set_page_config.
+
+Functions:
+    - compare_bom_vs_sld: Compare BoM signals against SLD extracted signals
+    - climate_voltage_check: Calculate string Voc at cold temperature
+    - run_ac_voltage_drop_review: Parse AC cable sizing and check limits
+    - saudi_standards_snapshot: Generate compliance snapshot
+"""
+from __future__ import annotations
+
 import io
-import math
-import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
-import pandas as pd
+from core.models import Issue
+from core.parsers.ac_cable_sizing import parse_ac_cable_sizing_excel
+from core.checks.voltage_drop import check_voltage_drop
 
 
+# -------------------------------------------------------------------
+# Data Classes
+# -------------------------------------------------------------------
 @dataclass
 class CheckStatus:
-    level: str  # "PASS" | "WARN" | "FAIL" | "INFO"
+    """
+    Result of an engineering check.
+
+    Attributes:
+        level: "PASS" | "WARN" | "FAIL"
+        title: Human-readable check name
+        details: List of findings/observations
+    """
+    level: str
     title: str
     details: List[str]
 
 
-def smart_find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    cols = {c.lower(): c for c in df.columns}
-    for cand in candidates:
-        if cand.lower() in cols:
-            return cols[cand.lower()]
-    return None
-
-
-def extract_bom_signals(df: pd.DataFrame) -> Dict:
+# -------------------------------------------------------------------
+# BoM vs SLD Consistency Check
+# -------------------------------------------------------------------
+def compare_bom_vs_sld(bom_sig: Dict[str, Any], sld_sig: Dict[str, Any]) -> CheckStatus:
     """
-    Extract signals from BoM with flexible column names.
-    Required for checks:
-      - Voc_STC per module
-      - Temp coefficient for Voc (per °C)
-      - Modules per string
-      - Inverter DC max voltage
-      - Inverter model/name (optional)
+    Compare BoM signals against SLD extracted signals.
+
+    Checks:
+        - Inverter DC max voltage consistency
+        - Modules per string consistency
+
+    Returns:
+        CheckStatus with PASS if values match, WARN if mismatch or missing.
     """
-    c_voc = smart_find_col(df, ["Voc_STC", "Voc", "Module_Voc", "PV_Voc"])
-    c_tc = smart_find_col(
-        df, ["TempCoeff", "Temp_Coeff", "Voc_TempCoeff", "TempCoeff_Voc"]
-    )
-    c_mps = smart_find_col(
-        df, ["ModulesPerString", "Modules_per_string", "MPS", "PanelsPerString"]
-    )
-    c_inv = smart_find_col(df, ["Inverter_Vmax", "InverterVmax", "DC_Vmax", "Vmax_DC"])
-    c_inv_name = smart_find_col(
-        df, ["Inverter", "InverterModel", "INV_Model", "Inverter_Model"]
+    details: List[str] = []
+    issues_found = False
+
+    # ----------------------------
+    # Check: Inverter DC max voltage
+    # ----------------------------
+    bom_vmax = bom_sig.get("inverter_vmax")
+    sld_vmax = sld_sig.get("inverter_vmax")
+
+    if bom_vmax is not None and sld_vmax is not None:
+        if abs(bom_vmax - sld_vmax) < 1.0:
+            details.append(f"✓ Inverter DC max voltage matches: {bom_vmax:.0f} V")
+        else:
+            details.append(f"✗ MISMATCH: BoM says {bom_vmax:.0f} V, SLD shows {sld_vmax:.0f} V")
+            issues_found = True
+    elif sld_vmax is None:
+        details.append("⚠ Inverter DC max voltage not detected in SLD")
+        issues_found = True
+    else:
+        details.append(f"• Inverter DC max from BoM: {bom_vmax:.0f} V")
+
+    # ----------------------------
+    # Check: Modules per string
+    # ----------------------------
+    bom_mps = bom_sig.get("modules_per_string")
+    sld_mps = sld_sig.get("modules_per_string")
+
+    if bom_mps is not None and sld_mps is not None:
+        if bom_mps == sld_mps:
+            details.append(f"✓ Modules per string matches: {bom_mps}")
+        else:
+            details.append(f"✗ MISMATCH: BoM says {bom_mps}, SLD shows {sld_mps}")
+            issues_found = True
+    elif sld_mps is None:
+        details.append("⚠ Modules per string not detected in SLD")
+    else:
+        details.append(f"• Modules per string from BoM: {bom_mps}")
+
+    return CheckStatus(
+        level="WARN" if issues_found else "PASS",
+        title="BoM vs SLD Consistency Check",
+        details=details,
     )
 
-    voc_stc = (
-        float(df[c_voc].dropna().iloc[0])
-        if c_voc and not df[c_voc].dropna().empty
-        else 49.5
-    )
-    temp_coeff = (
-        float(df[c_tc].dropna().iloc[0])
-        if c_tc and not df[c_tc].dropna().empty
-        else -0.0029
-    )
-    mps = (
-        int(df[c_mps].dropna().iloc[0])
-        if c_mps and not df[c_mps].dropna().empty
-        else 22
-    )
-    inverter_vmax = (
-        float(df[c_inv].dropna().iloc[0])
-        if c_inv and not df[c_inv].dropna().empty
-        else 1100.0
-    )
-    inverter_name = (
-        str(df[c_inv_name].dropna().iloc[0])
-        if c_inv_name and not df[c_inv_name].dropna().empty
-        else "Inverter model not specified"
-    )
 
-    # normalize percent coefficients
+# -------------------------------------------------------------------
+# Cold Weather Overvoltage Check
+# -------------------------------------------------------------------
+def climate_voltage_check(
+    bom_sig: Dict[str, Any],
+    tmin: float,
+) -> Tuple[CheckStatus, Dict[str, Any], List[str]]:
+    """
+    Calculate string Voc at cold temperature and compare to inverter DC max.
+
+    Formula:
+        Voc_cold = Voc_STC * (1 + TempCoeff * (Tmin - 25))
+        String_Voc_cold = Voc_cold * modules_per_string
+
+    Args:
+        bom_sig: Extracted BoM signals dict
+        tmin: Design minimum temperature (°C)
+
+    Returns:
+        Tuple of (CheckStatus, calculation_numbers, recommendations)
+    """
+    # Extract values with safe defaults
+    voc_stc = bom_sig.get("voc_stc", 49.5)
+    temp_coeff = bom_sig.get("temp_coeff", -0.0029)
+    mps = bom_sig.get("modules_per_string", 22)
+    inverter_vmax = bom_sig.get("inverter_vmax", 1100.0)
+
+    # Normalize temp coefficient (handle both -0.29% and -0.0029 formats)
     if abs(temp_coeff) > 0.05:
         temp_coeff = temp_coeff / 100.0
 
-    meta = {
-        "voc_source": c_voc or "DEFAULT",
-        "tc_source": c_tc or "DEFAULT",
-        "mps_source": c_mps or "DEFAULT",
-        "vmax_source": c_inv or "DEFAULT",
-        "invname_source": c_inv_name or "DEFAULT",
+    # ----------------------------
+    # Calculate Voc at Tmin
+    # ----------------------------
+    delta_t = tmin - 25.0
+    voc_cold = voc_stc * (1 + temp_coeff * delta_t)
+    string_voc_cold = voc_cold * mps
+
+    # Calculate margin
+    margin = inverter_vmax - string_voc_cold
+    margin_pct = (margin / inverter_vmax) * 100 if inverter_vmax > 0 else 0
+
+    # Store calculation values for transparency
+    numbers = {
+        "Voc_STC (V)": f"{voc_stc:.2f}",
+        "Temp coeff (/°C)": f"{temp_coeff:.4f}",
+        "Design Tmin (°C)": f"{tmin:.1f}",
+        "Delta T (°C)": f"{delta_t:.1f}",
+        "Voc_cold per module (V)": f"{voc_cold:.2f}",
+        "Modules per string": f"{mps}",
+        "String Voc_cold (V)": f"{string_voc_cold:.1f}",
+        "Inverter DC max (V)": f"{inverter_vmax:.0f}",
+        "Margin (V)": f"{margin:.1f}",
+        "Margin (%)": f"{margin_pct:.1f}%",
     }
 
-    return {
-        "voc_stc": voc_stc,
-        "temp_coeff": temp_coeff,
-        "modules_per_string": mps,
-        "inverter_vmax": inverter_vmax,
-        "inverter_name": inverter_name,
-        "meta": meta,
-    }
+    recommendations: List[str] = []
+
+    # ----------------------------
+    # Evaluate result
+    # ----------------------------
+    if string_voc_cold > inverter_vmax:
+        # FAIL: Overvoltage risk
+        details = [
+            f"String Voc at {tmin:.1f}°C = {string_voc_cold:.1f} V",
+            f"Inverter DC max = {inverter_vmax:.0f} V",
+            f"✗ OVERVOLTAGE RISK: exceeds limit by {abs(margin):.1f} V",
+        ]
+        recommendations = [
+            f"Reduce modules per string from {mps} to {int(inverter_vmax / voc_cold)}",
+            "Verify module datasheet Voc and temperature coefficient",
+            "Consider inverter with higher DC voltage rating",
+        ]
+        return (
+            CheckStatus(level="FAIL", title="Cold Weather Overvoltage Check", details=details),
+            numbers,
+            recommendations,
+        )
+
+    elif margin_pct < 5.0:
+        # WARN: Tight margin
+        details = [
+            f"String Voc at {tmin:.1f}°C = {string_voc_cold:.1f} V",
+            f"Inverter DC max = {inverter_vmax:.0f} V",
+            f"⚠ Margin is tight: {margin:.1f} V ({margin_pct:.1f}%)",
+        ]
+        recommendations = [
+            "Consider reducing modules per string for safety margin",
+            "Verify temperature coefficient from module datasheet",
+        ]
+        return (
+            CheckStatus(level="WARN", title="Cold Weather Overvoltage Check", details=details),
+            numbers,
+            recommendations,
+        )
+
+    else:
+        # PASS: Within safe limits
+        details = [
+            f"String Voc at {tmin:.1f}°C = {string_voc_cold:.1f} V",
+            f"Inverter DC max = {inverter_vmax:.0f} V",
+            f"✓ Margin: {margin:.1f} V ({margin_pct:.1f}%) — OK",
+        ]
+        return (
+            CheckStatus(level="PASS", title="Cold Weather Overvoltage Check", details=details),
+            numbers,
+            recommendations,
+        )
 
 
-def try_extract_from_sld(pdf_bytes: bytes) -> Dict:
+# -------------------------------------------------------------------
+# AC Voltage Drop Review
+# -------------------------------------------------------------------
+def run_ac_voltage_drop_review(
+    ac_cable_file: io.BytesIO,
+    inv_limit_pct: float = 3.0,
+    comb_limit_pct: float = 1.5,
+) -> Dict[str, Any]:
     """
-    Best-effort PDF text extraction (first pages) + regex.
-    Returns: inverter_vmax, modules_per_string, notes
-    """
-    out = {"inverter_vmax": None, "modules_per_string": None, "notes": ""}
+    Parse AC cable sizing Excel and check voltage drop limits.
 
+    Limits (per SEC/NEC standards):
+        - Inverter to Combiner: ≤ 3.0%
+        - Combiner to MDB: ≤ 1.5%
+
+    Returns:
+        Dict with 'kpis' and 'issues' keys
+    """
     try:
-        import PyPDF2  # type: ignore
+        inv_runs, comb_runs = parse_ac_cable_sizing_excel(ac_cable_file)
 
-        reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
-        text = ""
-        for i in range(min(len(reader.pages), 3)):
-            text += "\n" + (reader.pages[i].extract_text() or "")
+        issues = check_voltage_drop(
+            inv_runs,
+            comb_runs,
+            inverter_vd_limit_pct=inv_limit_pct,
+            combiner_vd_limit_pct=comb_limit_pct,
+        )
 
-        if not text.strip():
-            out["notes"] = "SLD text extraction empty (scan/image likely)."
-            return out
+        max_inv_vd = max((r.voltage_drop_pct for r in inv_runs), default=0.0)
+        max_comb_vd = max((r.voltage_drop_pct for r in comb_runs), default=0.0)
 
-        vmax_patterns = [
-            r"(?:DC\s*MAX|DC\s*MAXIMUM|VDC\s*MAX|V\s*MAX|MAX\s*DC)\s*[:=]?\s*(\d{3,4})\s*V",
-            r"(?:Vmax|V\s*max)\s*[:=]?\s*(\d{3,4})\s*V",
-            r"(\d{3,4})\s*V\s*(?:DC\s*MAX|VDC\s*MAX|MAX\s*DC)",
-        ]
-        for pat in vmax_patterns:
-            m = re.search(pat, text, flags=re.IGNORECASE)
-            if m:
-                out["inverter_vmax"] = float(m.group(1))
-                break
-
-        mps_patterns = [
-            r"(?:MODULES\s*/\s*STRING|MODULES\s*PER\s*STRING|MOD\s*/\s*STR)\s*[:=]?\s*(\d{1,3})",
-            r"\bMPS\b\s*[:=]?\s*(\d{1,3})",
-            r"(?:STRING)\s*[:=]?\s*(\d{1,3})\s*(?:MODULES|MOD)",
-        ]
-        for pat in mps_patterns:
-            m = re.search(pat, text, flags=re.IGNORECASE)
-            if m:
-                out["modules_per_string"] = int(m.group(1))
-                break
-
-        out["notes"] = "SLD signals extracted from text (best-effort)."
-        return out
+        return {
+            "kpis": {
+                "max_inverter_vd_pct": max_inv_vd,
+                "max_combiner_vd_pct": max_comb_vd,
+                "inverter_runs_count": len(inv_runs),
+                "combiner_runs_count": len(comb_runs),
+            },
+            "issues": issues,
+        }
 
     except Exception as e:
-        out["notes"] = f"SLD extraction unavailable ({type(e).__name__})."
-        return out
-
-
-def compare_bom_vs_sld(bom_sig: Dict, sld_sig: Dict) -> CheckStatus:
-    mismatch = []
-    gaps = []
-
-    if sld_sig.get("inverter_vmax") is None:
-        gaps.append("Inverter DC max voltage not detected in SLD.")
-    else:
-        if (
-            abs(float(bom_sig["inverter_vmax"]) - float(sld_sig["inverter_vmax"]))
-            > 1e-6
-        ):
-            mismatch.append(
-                f"Inverter DC max differs (BoM {bom_sig['inverter_vmax']:.0f} V vs SLD {float(sld_sig['inverter_vmax']):.0f} V)."
-            )
-
-    if sld_sig.get("modules_per_string") is None:
-        gaps.append("Modules/string not detected in SLD.")
-    else:
-        if int(bom_sig["modules_per_string"]) != int(sld_sig["modules_per_string"]):
-            mismatch.append(
-                f"Modules/string differs (BoM {bom_sig['modules_per_string']} vs SLD {int(sld_sig['modules_per_string'])})."
-            )
-
-    if mismatch:
-        return CheckStatus("WARN", "BoM ↔ SLD consistency", mismatch)
-    if gaps:
-        # Not a mismatch, but extraction incomplete
-        return CheckStatus(
-            "INFO",
-            "BoM ↔ SLD consistency",
-            gaps + ["If SLD is scanned, OCR/Vision is needed for reliable extraction."],
-        )
-    return CheckStatus(
-        "PASS", "BoM ↔ SLD consistency", ["BoM values match the detected SLD signals."]
-    )
-
-
-def calc_voc_cold(voc_stc: float, temp_coeff: float, tmin: float) -> float:
-    # Voc_cold = Voc_STC * (1 + |temp_coeff| * (25 - Tmin))
-    delta = 25.0 - float(tmin)
-    return voc_stc * (1.0 + abs(temp_coeff) * delta)
-
-
-def climate_voltage_check(
-    bom_sig: Dict, tmin: float
-) -> Tuple[CheckStatus, Dict, List[str]]:
-    """
-    Critical if string Voc at Tmin exceeds inverter DC max.
-    Recommend reducing modules/string to meet limit.
-    """
-    voc_cold = calc_voc_cold(bom_sig["voc_stc"], bom_sig["temp_coeff"], tmin)
-    mps = int(bom_sig["modules_per_string"])
-    vmax = float(bom_sig["inverter_vmax"])
-    string_v = voc_cold * mps
-
-    numbers = {
-        "Voc_STC_per_module_V": bom_sig["voc_stc"],
-        "TempCoeff_per_C": bom_sig["temp_coeff"],
-        "Tmin_C": float(tmin),
-        "Voc_cold_per_module_V": voc_cold,
-        "Modules_per_string": mps,
-        "String_Voc_at_Tmin_V": string_v,
-        "Inverter_DC_max_V": vmax,
-    }
-
-    recs = []
-
-    if string_v <= vmax:
-        return (
-            CheckStatus(
-                "PASS",
-                "Winter overvoltage risk",
-                ["Worst-case string Voc at Tmin is within inverter DC max."],
-            ),
-            numbers,
-            recs,
-        )
-
-    # find safe MPS
-    suggested = mps
-    while suggested > 1 and (voc_cold * suggested) > vmax:
-        suggested -= 1
-
-    recs.append(
-        f"Reduce modules/string from {mps} to {suggested} to keep string Voc at Tmin ≤ {vmax:.0f} V."
-    )
-    recs.append(
-        "Re-check string sizing for all MPPT inputs and confirm manufacturer absolute max DC voltage limits."
-    )
-    return (
-        CheckStatus(
-            "FAIL",
-            "Winter overvoltage risk",
-            [
-                "String Voc at Tmin exceeds inverter DC max. Potential inverter damage risk."
+        return {
+            "kpis": {
+                "max_inverter_vd_pct": 0.0,
+                "max_combiner_vd_pct": 0.0,
+                "inverter_runs_count": 0,
+                "combiner_runs_count": 0,
+            },
+            "issues": [
+                Issue(
+                    code="AC_PARSE_FAIL",
+                    severity="CRITICAL",
+                    title="Failed to parse AC Cable Sizing Excel",
+                    description=str(e),
+                )
             ],
-        ),
-        numbers,
-        recs,
-    )
+        }
 
 
+# -------------------------------------------------------------------
+# Saudi Standards Compliance Snapshot
+# -------------------------------------------------------------------
 def saudi_standards_snapshot(
-    climate_ok: bool, bom_sld_level: str
+    climate_ok: bool,
+    bom_sld_level: str,
 ) -> Tuple[List[str], List[str]]:
     """
-    Provide a professional snapshot aligned to typical Saudi / IEC expectations.
-    Output:
-      - compliant_points
-      - gaps_points (actionable)
+    Generate compliance snapshot based on check results.
+
+    References:
+        - SEC Distribution Grid Code
+        - SASO adoption of IEC 62548 (PV array design)
+        - NEC Article 690
+
+    Returns:
+        Tuple of (compliant_points, gaps_points)
     """
-    compliant = []
-    gaps = []
+    compliant: List[str] = []
+    gaps: List[str] = []
 
-    # SEC / IEC 62548 / IEC 60364 / labeling / protection 
+    # Climate / Overvoltage
     if climate_ok:
-        compliant.append(
-            "String sizing vs minimum temperature (overvoltage) check passed."
-        )
-        compliant.append("Inverter DC maximum verified against worst-case string Voc.")
+        compliant.append("String sizing within inverter DC voltage limits (IEC 62548)")
     else:
-        gaps.append(
-            "String sizing vs minimum temperature fails (overvoltage). Update design string length / MPPT allocation."
-        )
+        gaps.append("String Voc at Tmin may exceed inverter DC max")
 
-    if bom_sld_level in ("PASS", "INFO"):
-        compliant.append("BoM and SLD consistency check performed (best-effort).")
-        if bom_sld_level == "INFO":
-            gaps.append(
-                "SLD key signals not fully extracted. Provide native PDF (text) or enable OCR/Vision extraction."
-            )
+    # BoM vs SLD Consistency
+    if bom_sld_level == "PASS":
+        compliant.append("BoM and SLD documents are consistent")
     else:
-        gaps.append("BoM and SLD values mismatch. Resolve before procurement/approval.")
+        gaps.append("BoM and SLD show discrepancies — verify design intent")
 
-    gaps.extend(
-        [
-            "Protection coordination (DC fuses/breakers, SPD type and ratings) not validated from current inputs.",
-            "Labeling and isolation (DC isolators, emergency shutdown labels) require drawing confirmation.",
-            "Cable sizing/derating (installation method, ambient, grouping) not validated from current inputs.",
-            "Earthing/bonding continuity and conductor sizing not validated from current inputs.",
-            "Fire safety routing and rooftop requirements require site/fire review.",
-        ]
-    )
+    # Static compliance points
+    compliant.extend([
+        "Module Voc temperature coefficient considered",
+        "Site-specific historical Tmin used for analysis",
+    ])
+
+    gaps.extend([
+        "DC cable sizing verification not yet implemented",
+        "Grounding coordination requires manual review",
+    ])
 
     return compliant, gaps
