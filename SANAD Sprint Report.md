@@ -1,7 +1,7 @@
 # SANAD Sprint Report
 **Date:** February 3, 2026  
-**Branch:** `feature/pv-design-review-pipeline`  
-**Team:** UTURETHON Hackathon
+**Branch:** `feature/M7medBranch`  
+**Team:** SANAD
 
 ---
 
@@ -135,15 +135,6 @@ streamlit run app.py
 | P3 | Multi-language support (Arabic) | Medium |
 | P3 | Export to Excel format | Low |
 
----
-
-## 👥 Contributors
-
-| Name | Role |
-|------|------|
-| Mohammed Alharbi | Lead Developer |
-| [Team Member 2] | [Role] |
-| [Team Member 3] | [Role] |
 
 ---
 
