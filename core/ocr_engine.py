@@ -3,7 +3,6 @@ from pathlib import Path
 
 import cv2
 
-
 def extract_text(
     image_path: str,
     engine: str = "easy",
@@ -93,3 +92,4 @@ def extract_text(
             json.dump(output, f, ensure_ascii=False, indent=2)
 
     return output
+
