@@ -197,12 +197,14 @@ class SANADReportBuilder:
         calculated: Dict[str, Any],
         project_name: str = "PV System Design Review",
         standards_compliance: List[StandardCompliance] = None,
+        bom_components: List[Dict[str, Any]] | None = None,
     ):
         self.merged = merged
         self.analysis = analysis
         self.calculated = calculated
         self.project_name = project_name
         self.standards_compliance = standards_compliance or []
+        self.bom_components = bom_components or []
         self.styles = get_custom_styles()
         self.elements = []
     
@@ -226,6 +228,7 @@ class SANADReportBuilder:
         self._add_executive_summary()
         self._add_key_calculations()
         self._add_system_specifications()
+        self._add_bom_section()
         self._add_standards_compliance()
         self._add_all_issues()
         self._add_detailed_calculations()
@@ -359,16 +362,64 @@ class SANADReportBuilder:
         # Compliance percentage
         compliance_pct = self.analysis.overall_compliance_percent
         self.elements.append(Spacer(1, 0.5*cm))
+
+    def _add_bom_section(self):
+        """Add Bill of Materials section (auto-generated)."""
+        self.elements.append(Paragraph("Bill of Materials", self.styles['SectionHeader']))
+        self.elements.append(HRFlowable(width="100%", thickness=1, color=COLORS["primary"]))
+        self.elements.append(Spacer(1, 0.3*cm))
+
+        if not self.bom_components:
+            self.elements.append(Paragraph("BoM not generated. Run BoM generator in the app.", self.styles['SANADBody']))
+            self.elements.append(Spacer(1, 0.4*cm))
+            return
+
+        table_data = [["Component", "Description", "Qty", "Unit", "Notes"]]
+        for comp in self.bom_components:
+            table_data.append([
+                str(comp.get("name", ""))[:35],
+                str(comp.get("description", ""))[:45],
+                str(comp.get("quantity", "")),
+                str(comp.get("unit", "")),
+                str(comp.get("notes", ""))[:55],
+            ])
+
+        bom_table = Table(table_data, colWidths=[4*cm, 4.5*cm, 2*cm, 2*cm, 6*cm])
+        bom_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), COLORS["primary"]),
+            ('TEXTCOLOR', (0, 0), (-1, 0), COLORS["white"]),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('ALIGN', (2, 1), (3, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('GRID', (0, 0), (-1, -1), 0.4, colors.grey),
+            ('TOPPADDING', (0, 0), (-1, -1), 3),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+        ]))
+
+        self.elements.append(bom_table)
+        self.elements.append(Spacer(1, 0.4*cm))
+
+        # Small compliance tag for consistency with design language
+        pct = self.analysis.overall_compliance_percent
+        if pct >= 80:
+            status_color = COLORS["pass"]
+        elif pct >= 50:
+            status_color = COLORS["warning"]
+        else:
+            status_color = COLORS["critical"]
+
         self.elements.append(Paragraph(
-            f"Overall Compliance: {compliance_pct:.0f}%",
+            f"Overall Compliance: {pct:.0f}%",
             ParagraphStyle(
                 name='CompliancePct',
-                fontSize=14,
+                fontSize=10,
                 textColor=status_color,
-                alignment=TA_CENTER,
+                alignment=TA_RIGHT,
+                spaceAfter=4,
             )
         ))
-        
+
         self.elements.append(PageBreak())
     
     def _add_executive_summary(self):
@@ -961,6 +1012,7 @@ def generate_report(
     calculated: Dict[str, Any],
     project_name: str = "PV System Design Review",
     standards_compliance: List[StandardCompliance] = None,
+    bom_components: List[Dict[str, Any]] | None = None,
 ) -> bytes:
     """
     Generate comprehensive PDF compliance report.
@@ -971,6 +1023,7 @@ def generate_report(
         calculated: Calculated values dict
         project_name: Project name for cover page
         standards_compliance: List of standard compliance objects
+        bom_components: List of BoM component dicts (optional)
     
     Returns:
         PDF bytes
@@ -981,6 +1034,7 @@ def generate_report(
         calculated=calculated,
         project_name=project_name,
         standards_compliance=standards_compliance,
+        bom_components=bom_components,
     )
     
     return builder.build()

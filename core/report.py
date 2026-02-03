@@ -1,11 +1,11 @@
 import io
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
 from reportlab.lib import colors
 
 
@@ -47,10 +47,6 @@ def _bullet_list(items: List[str], story, styles):
 
 
 def generate_sanad_report(review_result: Dict[str, Any]) -> bytes:
-    """
-    Builds a single PDF report from the Stage 2 review_result dict.
-    This keeps report generation simple: Stage2 computes everything, report only formats.
-    """
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf,
@@ -65,13 +61,11 @@ def generate_sanad_report(review_result: Dict[str, Any]) -> bytes:
     styles = getSampleStyleSheet()
     story = []
 
-    # --- Header ---
     story.append(_p("<b>SANAD PV Design Review Report</b>", styles["Title"]))
     story.append(Spacer(1, 0.2 * cm))
     story.append(_p(f"Generated: {review_result.get('run_date', now_date_str())}", styles["BodyText"]))
     story.append(Spacer(1, 0.6 * cm))
 
-    # --- Project summary ---
     _section("Project Summary", story, styles)
 
     place = review_result.get("place")
@@ -95,7 +89,6 @@ def generate_sanad_report(review_result: Dict[str, Any]) -> bytes:
     )
     story.append(Spacer(1, 0.6 * cm))
 
-    # --- BoM signals ---
     _section("BoM Signals Used", story, styles)
 
     story.append(
@@ -111,7 +104,6 @@ def generate_sanad_report(review_result: Dict[str, Any]) -> bytes:
     )
     story.append(Spacer(1, 0.6 * cm))
 
-    # --- BoM vs SLD ---
     _section("BoM ↔ SLD Consistency", story, styles)
     bom_sld_status = review_result.get("bom_sld_status")
     if bom_sld_status:
@@ -122,7 +114,6 @@ def generate_sanad_report(review_result: Dict[str, Any]) -> bytes:
         story.append(_p("No result available.", styles["BodyText"]))
     story.append(Spacer(1, 0.4 * cm))
 
-    # --- Climate overvoltage ---
     _section("Winter Overvoltage Risk", story, styles)
     climate_status = review_result.get("climate_status")
     climate_numbers = review_result.get("climate_numbers", {})
@@ -151,7 +142,6 @@ def generate_sanad_report(review_result: Dict[str, Any]) -> bytes:
         story.append(_p("No result available.", styles["BodyText"]))
     story.append(Spacer(1, 0.6 * cm))
 
-    # --- AC voltage drop ---
     _section("AC Voltage Drop", story, styles)
     ac_vd_result = review_result.get("ac_vd_result")
 
@@ -180,8 +170,7 @@ def generate_sanad_report(review_result: Dict[str, Any]) -> bytes:
             story.append(_p(f"Result: <b>ISSUES FOUND</b> — {len(issues)} items.", styles["BodyText"]))
             story.append(Spacer(1, 0.15 * cm))
 
-            # List issues (keep it readable)
-            for it in issues[:30]:  # cap to avoid massive reports
+            for it in issues[:30]:
                 story.append(_p(f"• <b>{it.severity}</b> — {it.title}", styles["BodyText"]))
                 story.append(_p(f"{it.description}", styles["BodyText"]))
                 story.append(Spacer(1, 0.08 * cm))
@@ -191,7 +180,6 @@ def generate_sanad_report(review_result: Dict[str, Any]) -> bytes:
 
     story.append(Spacer(1, 0.6 * cm))
 
-    # --- Compliance snapshot ---
     _section("Compliance Snapshot", story, styles)
     compliant_points = review_result.get("compliant_points", [])
     gaps_points = review_result.get("gaps_points", [])
@@ -205,6 +193,18 @@ def generate_sanad_report(review_result: Dict[str, Any]) -> bytes:
     story.append(Spacer(1, 0.1 * cm))
     _bullet_list(gaps_points, story, styles)
 
-    # Build
     doc.build(story)
     return buf.getvalue()
+
+
+def _add_incomplete_data_warnings(self, review_result: Dict[str, Any]):
+    """Add warnings for incomplete data."""
+    warnings = review_result.get("warnings", [])
+    if warnings:
+        self.elements.append(Paragraph("⚠️ Incomplete Data Warnings", self.styles['SectionHeader']))
+        self.elements.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#ffc107")))
+        self.elements.append(Spacer(1, 0.3 * cm))
+
+        for warning in warnings:
+            self.elements.append(Paragraph(f"• {warning}", self.styles['WarningText']))
+            self.elements.append(Spacer(1, 0.1 * cm))

@@ -160,8 +160,10 @@ class MergedExtraction:
 class GeminiVisionExtractor:
     """Uses Google Gemini for document extraction."""
     
-    def __init__(self, model: str = "gemini-2.5-flash"):
-        self.model = model
+    def __init__(self, model: str | None = None):
+        # Prefer explicit argument, then env override, then strong default
+        env_model = os.getenv("GEMINI_MODEL")
+        self.model = model or env_model or "gemini-2.5-pro"
         self._client = None
         logger.info(f"GeminiVisionExtractor initialized with model: {self.model}")
     
@@ -769,51 +771,116 @@ def merge_extractions(
     tmin: float,
     tmax: float,
 ) -> MergedExtraction:
-    """Merge all extractions into a single unified structure."""
-    
+    """Merge all extractions into a single unified structure.
+
+    Notes:
+    - Be defensive: different extractors use slightly different field names.
+    - Prefer SLD values, then vision/OCR module/inverter, then cable/BoM fallbacks.
+    """
     merged = MergedExtraction()
-    
-    # System info from SLD
-    merged.system_capacity_kw = sld.system_capacity_kw
-    merged.modules_per_string = sld.modules_per_string
-    merged.strings_per_mppt = sld.strings_per_mppt or inverter.strings_per_mppt
-    merged.total_strings = sld.total_strings
-    
-    # PV Module (prefer datasheet, fallback to SLD)
-    merged.module_model = pv_module.model or sld.pv_module_model
-    merged.module_voc_v = pv_module.voc_v
-    merged.module_isc_a = pv_module.isc_a
-    merged.module_vmp_v = pv_module.vmp_v
-    merged.module_imp_a = pv_module.imp_a
-    merged.module_pmax_w = pv_module.pmax_w or sld.pv_module_power_w
-    merged.temp_coeff_voc = pv_module.temp_coeff_voc
-    
-    # Inverter (prefer datasheet, fallback to SLD)
-    merged.inverter_model = inverter.model or sld.inverter_model
-    merged.inverter_dc_max_voltage_v = inverter.dc_max_voltage_v
-    merged.inverter_mppt_min_v = inverter.mppt_voltage_min_v
-    merged.inverter_mppt_max_v = inverter.mppt_voltage_max_v
-    merged.inverter_ac_power_kw = inverter.ac_rated_power_kw
-    merged.mppt_count = inverter.mppt_count
-    
-    # Cables
-    merged.dc_cable_size_mm2 = cables.dc_cable_size_mm2 or sld.dc_cable_size_mm2
-    merged.ac_cable_size_mm2 = cables.ac_cable_size_mm2 or sld.ac_cable_size_mm2
-    merged.dc_voltage_drop_percent = cables.dc_voltage_drop_percent
-    merged.ac_voltage_drop_percent = cables.ac_voltage_drop_percent
-    
-    # Location & Climate
-    merged.location = location
-    merged.tmin_c = tmin
-    merged.tmax_c = tmax
-    
-    # Calculate confidence
-    confidences = [sld.confidence, pv_module.confidence, inverter.confidence, cables.confidence]
-    merged.confidence = sum(confidences) / len(confidences)
-    
-    # Validate
-    merged = validate_extraction(merged)
-    
+
+    # Basic metadata
+    merged.location = location or getattr(sld, "location", None)
+    merged.tmin_c = tmin if tmin is not None else getattr(sld, "tmin_c", None)
+    merged.tmax_c = tmax if tmax is not None else getattr(sld, "tmax_c", None)
+
+    # --- PV module ---
+    # model / electricals
+    merged.module_model = getattr(pv_module, "model", None) or getattr(sld, "pv_module_model", None)
+    merged.module_pmax_w = getattr(pv_module, "pmax_w", None) or getattr(pv_module, "module_pmax_w", None) or getattr(sld, "pv_module_power_w", None)
+    merged.module_voc_v = getattr(pv_module, "voc_v", None) or getattr(pv_module, "module_voc_v", None)
+    merged.module_isc_a = getattr(pv_module, "isc_a", None) or getattr(pv_module, "module_isc_a", None)
+    merged.module_vmp_v = getattr(pv_module, "vmp_v", None) or getattr(pv_module, "module_vmp_v", None)
+    merged.module_imp_a = getattr(pv_module, "imp_a", None) or getattr(pv_module, "module_imp_a", None)
+
+    # temperature coefficient: support both naming conventions
+    temp_coeff = None
+    for name in ("temp_coeff_voc", "temp_coeff_voc_percent_c", "temp_coeff"):
+        temp_coeff = getattr(pv_module, name, None)
+        if temp_coeff is not None:
+            break
+    # normalize percent -> decimal if looks like percent (e.g. -0.29)
+    if temp_coeff is not None:
+        try:
+            tc = float(temp_coeff)
+            if abs(tc) > 0.05:  # likely given as percent like -0.29
+                tc = tc / 100.0
+            merged.temp_coeff_voc = tc
+        except Exception:
+            merged.temp_coeff_voc = None
+    else:
+        merged.temp_coeff_voc = getattr(sld, "temp_coeff_voc", None)
+
+    # --- Inverter ---
+    merged.inverter_model = getattr(inverter, "model", None) or getattr(sld, "inverter_model", None)
+    # DC max voltage (support various names)
+    merged.inverter_dc_max_voltage_v = (
+        getattr(inverter, "dc_max_voltage_v", None)
+        or getattr(inverter, "inverter_dc_max_v", None)
+        or getattr(sld, "inverter_vmax", None)
+    )
+    # MPPT min/max (support variants)
+    merged.inverter_mppt_min_v = (
+        getattr(inverter, "mppt_voltage_min_v", None)
+        or getattr(inverter, "dc_mppt_voltage_min_v", None)
+        or getattr(inverter, "mppt_min_v", None)
+    )
+    merged.inverter_mppt_max_v = (
+        getattr(inverter, "mppt_voltage_max_v", None)
+        or getattr(inverter, "dc_mppt_voltage_max_v", None)
+        or getattr(inverter, "mppt_max_v", None)
+    )
+    merged.inverter_ac_power_kw = getattr(inverter, "ac_rated_power_kw", None) or getattr(inverter, "ac_power_kw", None) or getattr(sld, "inverter_capacity_kw", None)
+    merged.mppt_count = getattr(inverter, "mppt_count", None) or getattr(sld, "inverter_count", None)
+
+    # --- String configuration (prefer SLD) ---
+    merged.modules_per_string = getattr(sld, "modules_per_string", None) or getattr(pv_module, "modules_per_string", None) or getattr(pv_module, "mps", None)
+    merged.strings_per_mppt = getattr(sld, "strings_per_mppt", None) or getattr(inverter, "strings_per_mppt", None)
+    merged.total_strings = getattr(sld, "total_strings", None)
+
+    # --- Cables / voltage drop ---
+    merged.dc_cable_size_mm2 = getattr(cables, "dc_cable_size_mm2", None) or getattr(sld, "dc_cable_size_mm2", None)
+    merged.ac_cable_size_mm2 = getattr(cables, "ac_cable_size_mm2", None) or getattr(sld, "ac_cable_size_mm2", None)
+    merged.dc_voltage_drop_percent = getattr(cables, "dc_voltage_drop_percent", None) or getattr(cables, "dc_voltage_drop_pct", None)
+    merged.ac_voltage_drop_percent = getattr(cables, "ac_voltage_drop_percent", None) or getattr(cables, "ac_voltage_drop_pct", None)
+
+    # --- System capacity fallback ---
+    # prefer SLD system capacity, else try PV/module * total modules, else inverter AC power
+    merged.system_capacity_kw = getattr(sld, "system_capacity_kw", None)
+    if merged.system_capacity_kw is None:
+        if merged.module_pmax_w and getattr(merged, "total_strings", None):
+            try:
+                merged.system_capacity_kw = (merged.module_pmax_w * (getattr(sld, "total_modules", merged.total_strings * (merged.modules_per_string or 0)))) / 1000.0
+            except Exception:
+                merged.system_capacity_kw = None
+    if merged.system_capacity_kw is None:
+        merged.system_capacity_kw = merged.inverter_ac_power_kw
+
+    # confidence: average of source confidences where available
+    confs = []
+    for src in (getattr(sld, "confidence", None), getattr(pv_module, "confidence", None), getattr(inverter, "confidence", None), getattr(cables, "confidence", None)):
+        if src is not None:
+            try:
+                confs.append(float(src))
+            except Exception:
+                pass
+    merged.confidence = sum(confs) / len(confs) if confs else 0.0
+
+    # notes: combine short summaries if present
+    notes = []
+    for obj in (sld, pv_module, inverter, cables):
+        if not obj:
+            continue
+        n = getattr(obj, "notes", None) or getattr(obj, "notes", "")
+        if n:
+            notes.append(n)
+    merged.notes = " | ".join(notes) if notes else ""
+
+    # Final validation fixes (common issues)
+    # ensure temp coeff decimal form
+    if merged.temp_coeff_voc is not None and abs(merged.temp_coeff_voc) > 0.05:
+        merged.temp_coeff_voc = merged.temp_coeff_voc / 100.0
+
     return merged
 
 

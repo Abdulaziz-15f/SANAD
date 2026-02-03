@@ -41,6 +41,8 @@ from core.pipelines.analysis_pipeline import (
     run_analysis_pipeline,
     Severity,
 )
+from core.pipelines.bom_builder import build_bom_from_extraction
+from core.pipelines.bom_generator import generate_bom_file
 
 
 def render_stage2():
@@ -552,6 +554,37 @@ def _render_review_results():
     with col4:
         total_vd = calculated.get("total_voltage_drop_pct")
         st.metric("Total Voltage Drop", f"{total_vd:.2f}%" if total_vd is not None else "N/A")
+
+    # BoM inline summary (keeps same visual language)
+    st.markdown("### Bill of Materials (auto-generated)")
+    bom_components = st.session_state.get("bom_components")
+    if bom_components is None and merged:
+        try:
+            bom_components, bom_debug = build_bom_from_extraction(merged)
+            st.session_state["bom_components"] = bom_components
+            st.session_state["bom_debug"] = bom_debug
+        except Exception as e:
+            st.warning(f"BoM not available yet: {e}")
+            bom_components = []
+
+    if bom_components:
+        # Compact summary chips
+        q = st.session_state.get("bom_debug", {}).get("quantities", {})
+        chips = [
+            ("Modules", q.get("modules")),
+            ("Strings", q.get("strings")),
+            ("Modules/String", q.get("modules_per_string")),
+            ("Inverters", q.get("inverters")),
+        ]
+        chip_cols = st.columns(len(chips))
+        for col, (label, value) in zip(chip_cols, chips):
+            with col:
+                st.metric(label, value if value is not None else "N/A")
+
+        with st.expander("BoM Components", expanded=False):
+            st.dataframe(pd.DataFrame(bom_components))
+    else:
+        st.info("BoM will appear here after generation.")
     
     # Standards Compliance
     if standards:
@@ -604,16 +637,42 @@ def _render_review_results():
     
     # Buttons
     st.markdown("---")
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     
     with col1:
         if st.button("📄 Generate PDF Report", type="primary", use_container_width=True):
             _generate_report()
     
     with col2:
+        if st.button("📦 Generate BoM (Excel)", use_container_width=True):
+            try:
+                if not merged:
+                    raise ValueError("Extraction data is missing. Run analysis first.")
+                components, bom_debug = build_bom_from_extraction(merged)
+                bom_bytes = generate_bom_file(components)
+                st.session_state["bom_bytes"] = bom_bytes
+                st.session_state["bom_components"] = components
+                st.session_state["bom_debug"] = bom_debug
+                st.success("✅ تم توليد BoM بناءً على البيانات المستخرجة")
+            except Exception as e:
+                st.error(f"❌ فشل في توليد BoM: {str(e)}")
+    
+    with col3:
         if st.button("🔄 Re-analyze", use_container_width=True):
             st.session_state["extraction_complete"] = False
             st.rerun()
+
+    if st.session_state.get("bom_bytes"):
+        filename = f"SANAD_BoM_{pd.Timestamp.now().strftime('%Y-%m-%d_%H%M')}.xlsx"
+        st.download_button(
+            label="📥 Download BoM",
+            data=st.session_state["bom_bytes"],
+            file_name=filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        with st.expander("📋 BoM Preview", expanded=False):
+            st.dataframe(pd.DataFrame(st.session_state.get("bom_components", [])))
 
 
 def _generate_report():
@@ -626,6 +685,14 @@ def _generate_report():
         analysis_data = get_analysis()
         calculated = st.session_state.get("calculated_values", {})
         standards_compliance = st.session_state.get("standards_compliance", [])
+        bom_components = st.session_state.get("bom_components")
+
+        # If BoM not generated yet, build it on-the-fly for the report
+        if bom_components is None and merged:
+            try:
+                bom_components, _ = build_bom_from_extraction(merged)
+            except Exception:
+                bom_components = []
         
         # Reconstruct Issue objects
         issues = [Issue(
@@ -671,6 +738,7 @@ def _generate_report():
                 calculated=calculated,
                 project_name=st.session_state.get("place", "PV System"),
                 standards_compliance=standards_compliance,
+                bom_components=bom_components,
             )
             
             from datetime import datetime

@@ -54,3 +54,13 @@ if uploaded_file:
             file_name="sld_text.json",
             mime="application/json",
         )
+
+def display_bom_download(bom_path: str):
+    """Display a download button for the BoM file."""
+    with open(bom_path, "rb") as bom_file:
+        st.download_button(
+            label="📥 Download BoM",
+            data=bom_file,
+            file_name="Generated_BoM.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
