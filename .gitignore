@@ -132,3 +132,7 @@ secrets.json
 # Large data files (uncomment if needed)
 # data/raw/
 # data/uploads/
+
+# Environment variables
+.env
+.env.local

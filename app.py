@@ -1,7 +1,23 @@
+"""
+SANAD - Smart Automated Network for Auditing and Design Compliance
+
+Main application entry point.
+Multi-stage PV design review pipeline.
+"""
 import pandas as pd
 import streamlit as st
 
-from core.state import init_state, reset_all
+from core.state import (
+    init_state, 
+    reset_all, 
+    set_upload,
+    set_multiple_uploads,
+    clear_upload, 
+    get_upload,
+    get_multiple_uploads,
+    is_upload_ready,
+    all_required_uploads_ready,
+)
 from core.theme import apply_theme
 from core.ui_components import header, render_map, weather_summary
 from core.weather import fetch_current_weather, fetch_design_climate, geocode_list
@@ -11,8 +27,8 @@ from core.weather import fetch_current_weather, fetch_design_climate, geocode_li
 # Page / App Setup
 # -------------------------------------------------------------------
 st.set_page_config(
-    page_title="SANAD — PV Design Intake",
-    page_icon="SANAD",
+    page_title="SANAD — PV Design Review",
+    page_icon="☀️",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -20,22 +36,56 @@ st.set_page_config(
 apply_theme()
 init_state()
 
-# Stage routing (1 = intake, 2 = review)
-st.session_state.setdefault("stage", 1)
-
 header("SANAD")
 
 
 # -------------------------------------------------------------------
-# Helpers
+# Upload Configuration
 # -------------------------------------------------------------------
-def _clear_upload_state(name_key: str, bytes_key: str) -> None:
-    """
-    Clear stored file info when the user removes an upload.
-    This prevents stale bytes from remaining in session_state across reruns.
-    """
-    st.session_state[name_key] = None
-    st.session_state[bytes_key] = None
+UPLOAD_CONFIG = {
+    "sld": {
+        "label": "Single-Line Diagram (SLD)",
+        "type": ["pdf"],
+        "required": True,
+        "multiple": False,  # SLD = single file only
+        "help": "AC/DC Single Line Diagram of the PV system",
+    },
+    "pv_datasheet": {
+        "label": "PV Module Datasheet",
+        "type": ["pdf"],
+        "required": True,
+        "multiple": True,  # Multiple datasheets allowed
+        "help": "Manufacturer datasheet(s) with Voc, Isc, temperature coefficients",
+    },
+    "inverter_datasheet": {
+        "label": "Inverter Datasheet",
+        "type": ["pdf"],
+        "required": True,
+        "multiple": True,  # Multiple inverter datasheets allowed
+        "help": "Manufacturer datasheet(s) with DC input specs, MPPT range",
+    },
+    "cable_sizing": {
+        "label": "Cable Sizing Calculations",
+        "type": ["xlsx", "xls"],
+        "required": True,
+        "multiple": True,  # Multiple cable sheets allowed
+        "help": "AC/DC cable sizing with voltage drop calculations",
+    },
+    "protection": {
+        "label": "Protection System (Optional)",
+        "type": ["pdf"],
+        "required": False,
+        "multiple": True,
+        "help": "Protection devices specifications and settings",
+    },
+    "pv_report": {
+        "label": "PV System Report (Optional)",
+        "type": ["pdf"],
+        "required": False,
+        "multiple": True,
+        "help": "Design calculations report from PVsyst or similar",
+    },
+}
 
 
 # -------------------------------------------------------------------
@@ -48,18 +98,17 @@ if st.session_state["stage"] == 1:
     # Left: Site selection
     # ----------------------------
     with left:
-        st.markdown('<div class="sg-h2">Site selection</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sg-h2">Site Selection</div>', unsafe_allow_html=True)
 
         q = st.text_input(
             "Search (city / region)",
-            placeholder="NEOM, Tabuk, Riyadh, Jeddah, Makkah",
+            placeholder="NEOM, Tabuk, Riyadh, Jeddah, Makkah, Dammam",
         )
 
-        a, b = st.columns([1, 1])
+        col_search, col_reset = st.columns([1, 1])
 
-        with a:
-            st.markdown('<div class="sg-btn-primary">', unsafe_allow_html=True)
-            if st.button("Search", use_container_width=True, type="secondary"):
+        with col_search:
+            if st.button("🔍 Search", use_container_width=True, type="primary"):
                 if not q.strip():
                     st.warning("Enter a city/region name.")
                 else:
@@ -68,17 +117,13 @@ if st.session_state["stage"] == 1:
                     except Exception as e:
                         st.session_state["geo_results"] = None
                         st.error(f"Search failed: {e}")
-            st.markdown("</div>", unsafe_allow_html=True)
 
-        with b:
-            st.markdown('<div class="sg-btn-ghost">', unsafe_allow_html=True)
-            if st.button("Reset", use_container_width=True):
-                # Single reset point so we don't accidentally wipe uploads on Streamlit reruns.
+        with col_reset:
+            if st.button("🔄 Reset All", use_container_width=True):
                 reset_all()
-                st.session_state["stage"] = 1
                 st.rerun()
-            st.markdown("</div>", unsafe_allow_html=True)
 
+        # Results dropdown
         results = st.session_state.get("geo_results") or []
         options = []
         for it in results:
@@ -108,7 +153,7 @@ if st.session_state["stage"] == 1:
             country = it.get("country")
             preview_place = f"{name}, {admin1}, {country}" if admin1 else f"{name}, {country}"
             zoom = 7
-        elif st.session_state.get("lat") is not None and st.session_state.get("lon") is not None:
+        elif st.session_state.get("lat") is not None:
             preview_lat = float(st.session_state["lat"])
             preview_lon = float(st.session_state["lon"])
             preview_place = st.session_state.get("place")
@@ -118,11 +163,10 @@ if st.session_state["stage"] == 1:
             preview_place = None
             zoom = 5
 
-        render_map(preview_lat, preview_lon, preview_place, height=320, zoom=zoom)
+        render_map(preview_lat, preview_lon, preview_place, height=300, zoom=zoom)
 
-        # Persist selected site
-        st.markdown('<div class="sg-btn-clean">', unsafe_allow_html=True)
-        if st.button("Set site", use_container_width=True, disabled=(selected_idx is None)):
+        # Set site button
+        if st.button("📍 Set Site", use_container_width=True, disabled=(selected_idx is None)):
             it = results[selected_idx]
             lat = float(it.get("latitude"))
             lon = float(it.get("longitude"))
@@ -135,7 +179,6 @@ if st.session_state["stage"] == 1:
             st.session_state["lat"] = lat
             st.session_state["lon"] = lon
 
-            # Fetch current weather (temp + wind)
             try:
                 current = fetch_current_weather(lat, lon)
                 st.session_state["current_temp"] = current.get("current_temp")
@@ -144,7 +187,6 @@ if st.session_state["stage"] == 1:
                 st.session_state["current_temp"] = None
                 st.session_state["current_wind_speed"] = None
 
-            # Fetch design climate data (Tmin, Tmax, max wind)
             try:
                 climate = fetch_design_climate(lat, lon, years=10)
                 st.session_state["tmin"] = climate.get("tmin")
@@ -155,59 +197,118 @@ if st.session_state["stage"] == 1:
                 st.session_state["tmin"] = None
                 st.session_state["tmax"] = None
                 st.session_state["max_wind_speed"] = None
-                st.session_state["tmin_method"] = "Archive: failed to derive climate data"
+                st.session_state["tmin_method"] = "Failed to fetch climate data"
 
             st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
 
     # ----------------------------
-    # Right: Uploads + Weather
+    # Right: Document Uploads
     # ----------------------------
     with right:
-        st.markdown('<div class="sg-h2">Input documents</div>', unsafe_allow_html=True)
-
-        # Required uploads for Stage 2
-        sld = st.file_uploader("Single-Line Diagram (PDF) — required", type=["pdf"])
-        bom = st.file_uploader("Bill of Materials (Excel) — required", type=["xlsx", "xls"])
-        ac_cable = st.file_uploader(
-            "AC Cable Sizing / Voltage Drop (Excel) — required",
-            type=["xlsx", "xls"],
-        )
-
-        # --- SLD storage (bytes) ---
-        if sld is not None:
-            st.session_state["sld_pdf_name"] = sld.name
-            st.session_state["sld_pdf_bytes"] = sld.getvalue()
-        else:
-            _clear_upload_state("sld_pdf_name", "sld_pdf_bytes")
-
-        # --- BoM storage (dataframe) ---
-        if bom is not None:
-            st.session_state["bom_name"] = bom.name
-            try:
-                df = pd.read_excel(bom)
-                st.session_state["bom_df"] = df
-                st.success("BoM loaded successfully.")
-                with st.expander("Preview (first 10 rows)"):
-                    st.dataframe(df.head(10), use_container_width=True)
-            except Exception as e:
-                st.session_state["bom_df"] = None
-                st.error(f"Failed to read BoM Excel: {e}")
-        else:
-            st.session_state["bom_name"] = None
-            st.session_state["bom_df"] = None
-
-        # --- AC cable sizing storage (bytes) ---
-        if ac_cable is not None:
-            st.session_state["ac_cable_name"] = ac_cable.name
-            st.session_state["ac_cable_bytes"] = ac_cable.getvalue()
-            st.success("AC Cable Sizing Excel loaded successfully.")
-        else:
-            _clear_upload_state("ac_cable_name", "ac_cable_bytes")
+        st.markdown('<div class="sg-h2">Project Documents</div>', unsafe_allow_html=True)
+        
+        # Required uploads section
+        st.markdown("**Required Documents:**")
+        
+        for key, config in UPLOAD_CONFIG.items():
+            if not config["required"]:
+                continue
+            
+            accept_multiple = config.get("multiple", False)
+            
+            if accept_multiple:
+                # Multiple file uploader
+                uploaded_files = st.file_uploader(
+                    f"{config['label']} — required",
+                    type=config["type"],
+                    help=config["help"],
+                    key=f"upload_{key}",
+                    accept_multiple_files=True,
+                )
+                
+                if uploaded_files:
+                    files_data = []
+                    for uf in uploaded_files:
+                        file_bytes = uf.getvalue()
+                        file_info = {"name": uf.name, "bytes": file_bytes}
+                        
+                        # Handle Excel files
+                        if key == "cable_sizing":
+                            try:
+                                df = pd.read_excel(uf)
+                                file_info["df"] = df
+                            except Exception as e:
+                                st.warning(f"Could not read {uf.name}: {e}")
+                                file_info["df"] = None
+                        
+                        files_data.append(file_info)
+                    
+                    set_multiple_uploads(key, files_data)
+                    st.success(f"✓ {len(files_data)} file(s) loaded for {config['label']}")
+                else:
+                    clear_upload(key)
+            else:
+                # Single file uploader (SLD only)
+                uploaded_file = st.file_uploader(
+                    f"{config['label']} — required",
+                    type=config["type"],
+                    help=config["help"],
+                    key=f"upload_{key}",
+                    accept_multiple_files=False,
+                )
+                
+                if uploaded_file is not None:
+                    file_bytes = uploaded_file.getvalue()
+                    set_upload(key, uploaded_file.name, file_bytes)
+                    st.success(f"✓ {config['label']} loaded")
+                else:
+                    clear_upload(key)
+        
+        # Optional uploads section
+        with st.expander("Optional Documents"):
+            for key, config in UPLOAD_CONFIG.items():
+                if config["required"]:
+                    continue
+                
+                accept_multiple = config.get("multiple", False)
+                
+                if accept_multiple:
+                    uploaded_files = st.file_uploader(
+                        config["label"],
+                        type=config["type"],
+                        help=config["help"],
+                        key=f"upload_{key}",
+                        accept_multiple_files=True,
+                    )
+                    
+                    if uploaded_files:
+                        files_data = []
+                        for uf in uploaded_files:
+                            files_data.append({
+                                "name": uf.name,
+                                "bytes": uf.getvalue(),
+                            })
+                        set_multiple_uploads(key, files_data)
+                        st.success(f"✓ {len(files_data)} file(s) loaded")
+                    else:
+                        clear_upload(key)
+                else:
+                    uploaded_file = st.file_uploader(
+                        config["label"],
+                        type=config["type"],
+                        help=config["help"],
+                        key=f"upload_{key}",
+                    )
+                    
+                    if uploaded_file is not None:
+                        set_upload(key, uploaded_file.name, uploaded_file.getvalue())
+                        st.success(f"✓ {config['label']} loaded")
+                    else:
+                        clear_upload(key)
 
         st.markdown('<div class="sg-divider"></div>', unsafe_allow_html=True)
 
-        # Weather summary for context + climate data visibility
+        # Weather summary
         weather_summary(
             st.session_state.get("place"),
             st.session_state.get("current_temp"),
@@ -218,57 +319,57 @@ if st.session_state["stage"] == 1:
             current_wind_speed=st.session_state.get("current_wind_speed"),
         )
 
-        # --- Manual Tmin fallback if auto-fetch failed ---
+        # Manual Tmin fallback
         if st.session_state.get("place") and st.session_state.get("tmin") is None:
-            st.warning("⚠️ Could not fetch historical Tmin automatically. Please enter manually.")
+            st.warning("Could not fetch historical Tmin. Please enter manually.")
             manual_tmin = st.number_input(
-                "Design Tmin (°C) — lowest expected temperature",
+                "Design Tmin (C)",
                 min_value=-20.0,
                 max_value=50.0,
                 value=5.0,
                 step=0.5,
-                help="Enter the lowest temperature expected at this site (used for overvoltage check)",
             )
             if st.button("Set Manual Tmin"):
                 st.session_state["tmin"] = manual_tmin
-                st.session_state["tmin_method"] = "Manual entry by user"
+                st.session_state["tmin_method"] = "Manual entry"
                 st.rerun()
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # Continue gating (all required inputs must exist)
-        ready = all(
-            [
-                st.session_state.get("place"),
-                st.session_state.get("lat") is not None,
-                st.session_state.get("lon") is not None,
-                st.session_state.get("tmin") is not None,
-                st.session_state.get("sld_pdf_bytes") is not None,
-                st.session_state.get("bom_df") is not None,
-                st.session_state.get("ac_cable_bytes") is not None,
-            ]
-        )
+        # Check readiness
+        ready = all([
+            st.session_state.get("place"),
+            st.session_state.get("lat") is not None,
+            st.session_state.get("tmin") is not None,
+            all_required_uploads_ready(),
+        ])
 
-        st.markdown('<div class="sg-btn-primary">', unsafe_allow_html=True)
-        if st.button("Continue", use_container_width=True, disabled=not ready):
+        if st.button("Continue to Review", use_container_width=True, disabled=not ready, type="primary"):
             st.session_state["stage"] = 2
             st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
+        
+        if not ready:
+            missing = []
+            if not st.session_state.get("place"):
+                missing.append("Site location")
+            if st.session_state.get("tmin") is None:
+                missing.append("Design Tmin")
+            for key, config in UPLOAD_CONFIG.items():
+                if config["required"] and not is_upload_ready(key):
+                    missing.append(config["label"])
+            
+            if missing:
+                st.info(f"Missing: {', '.join(missing)}")
 
 
 # -------------------------------------------------------------------
 # Stage 2: Review + Export
 # -------------------------------------------------------------------
 elif st.session_state["stage"] == 2:
-    # Import here to avoid circular imports during Streamlit reruns
     from core.stage2 import render_stage2
-
-    # Run the actual review UI + report export
     render_stage2()
 
     st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown('<div class="sg-btn-ghost">', unsafe_allow_html=True)
     if st.button("Back to Stage 1", use_container_width=True):
         st.session_state["stage"] = 1
         st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
