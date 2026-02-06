@@ -166,8 +166,11 @@ def climate_voltage_check(
             f"Inverter DC max = {inverter_vmax:.0f} V",
             f"✗ OVERVOLTAGE RISK: exceeds limit by {abs(margin):.1f} V",
         ]
+        # Design-safe modules per string suggestion
+        suggested_mps = max(1, int(inverter_vmax // voc_cold))
+        numbers["Suggested modules per string"] = f"{suggested_mps}"
         recommendations = [
-            f"Reduce modules per string from {mps} to {int(inverter_vmax / voc_cold)}",
+            f"Reduce modules per string from {mps} to {suggested_mps}",
             "Verify module datasheet Voc and temperature coefficient",
             "Consider inverter with higher DC voltage rating",
         ]

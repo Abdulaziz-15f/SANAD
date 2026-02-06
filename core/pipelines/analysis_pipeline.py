@@ -494,7 +494,10 @@ class AnalysisEngine:
     def _check_dc_ac_ratio(self, data: MergedExtraction) -> None:
         """Check DC/AC ratio."""
         dc_power = data.system_capacity_kw
-        ac_power = data.inverter_ac_power_kw
+        # Account for multiple inverters; assume count >=1 for safety
+        inverter_count = getattr(data, "inverter_count", None) or 1
+        ac_power_single = data.inverter_ac_power_kw
+        ac_power = ac_power_single * inverter_count if ac_power_single else None
         
         if not dc_power or not ac_power:
             self._add_check("SEC_BEST", StandardCheck(
@@ -508,6 +511,7 @@ class AnalysisEngine:
         self.calculated["dc_ac_ratio"] = round(ratio, 2)
         self.calculated["dc_power_kw"] = dc_power
         self.calculated["ac_power_kw"] = ac_power
+        self.calculated["inverter_count"] = inverter_count
         
         if ratio > 1.5:
             self._add_check("SEC_BEST", StandardCheck(
@@ -632,11 +636,62 @@ class AnalysisEngine:
                     reference="SEC Best Practice",
                     priority_score=60,
                 ))
+        elif dc_vd is not None or ac_vd is not None:
+            # Show whatever is available, but flag missing counterpart
+            total_vd = dc_vd if dc_vd is not None else ac_vd
+            self.calculated["total_voltage_drop_pct"] = total_vd
+            missing_side = "AC" if dc_vd is not None else "DC"
+            self.issues.append(Issue(
+                severity=Severity.INFO,
+                title=f"{missing_side} Voltage Drop Missing",
+                description=f"{missing_side} voltage drop data not provided; total uses available side only",
+                actual_value=f"{total_vd:.2f}%",
+                required_value="Provide both AC and DC drops for full check",
+                impact="Total VD may be understated",
+                recommendation=f"Add {missing_side} voltage drop column in cable sheet",
+                reference="SEC Best Practice",
+                priority_score=20,
+            ))
     
     def _check_environmental(self, data: MergedExtraction) -> None:
         """Check environmental considerations."""
         location = data.location or ""
         tmax = data.tmax_c
+        current_wind = getattr(data, "current_wind_speed", None)
+        max_wind = getattr(data, "max_wind_speed", None)
+        if current_wind is not None:
+            self.calculated["current_wind_speed_kmh"] = current_wind
+        if max_wind is not None:
+            self.calculated["max_wind_speed_kmh"] = max_wind
+            # Rear-side static load check (wind pressure vs module rear rating)
+            try:
+                v_ms = max_wind / 3.6  # km/h -> m/s
+                wind_pressure_pa = 0.613 * (v_ms ** 2)  # simplified q = 0.613 V^2
+                rear_rating_pa = 2400.0  # typical rear-side static load rating
+                self.calculated["rear_static_load_pa"] = round(wind_pressure_pa, 1)
+                self.calculated["rear_static_rating_pa"] = rear_rating_pa
+                if wind_pressure_pa > rear_rating_pa:
+                    self.issues.append(Issue(
+                        severity=Severity.WARNING,
+                        title="Rear-Side Static Load Exceeds Rating",
+                        description=f"Wind pressure {wind_pressure_pa:.0f} Pa exceeds typical rear rating {rear_rating_pa:.0f} Pa",
+                        actual_value=f"{wind_pressure_pa:.0f} Pa",
+                        required_value=f"≤ {rear_rating_pa:.0f} Pa",
+                        impact="Risk of module/frame damage under extreme wind",
+                        recommendation="Verify module load rating and racking design; consider higher-rated modules or additional anchorage",
+                        reference="IEC 61215 / manufacturer datasheet",
+                        priority_score=55,
+                    ))
+                else:
+                    self._add_check("SEC_CONN", StandardCheck(
+                        name="Rear Static Load (Wind)",
+                        description="Wind-induced rear load within module rating",
+                        status="PASS",
+                        actual_value=f"{wind_pressure_pa:.0f} Pa",
+                        required_value=f"≤ {rear_rating_pa:.0f} Pa",
+                    ))
+            except Exception:
+                pass
         
         # Coastal areas
         coastal_keywords = ["jeddah", "dammam", "yanbu", "jubail", "khobar", "jizan"]
@@ -669,6 +724,21 @@ class AnalysisEngine:
                 status="PASS",
                 actual_value=f"Location: {location}",
             ))
+
+        # High wind advisory if max gust available
+        if max_wind is not None:
+            if max_wind >= 80:  # km/h threshold (~22 m/s)
+                self.issues.append(Issue(
+                    severity=Severity.INFO,
+                    title="High Wind Gusts",
+                    description=f"10-year max gust = {max_wind:.1f} km/h",
+                    actual_value=f"{max_wind:.1f} km/h",
+                    required_value="Verify structural/wind load rating",
+                    impact="Potential structural and mounting stress",
+                    recommendation="Confirm racking anchorage and wind load design per local code",
+                    reference="SEC Best Practice",
+                    priority_score=25,
+                ))
         
         # High temperature
         if tmax and tmax > 45:

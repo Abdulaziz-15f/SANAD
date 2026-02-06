@@ -11,7 +11,9 @@ from __future__ import annotations
 import math
 import re
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
+
+from difflib import SequenceMatcher
 
 import pandas as pd
 
@@ -42,12 +44,37 @@ def _extract_power_from_name(name: str) -> float | None:
     return float(m.group(1)) if m else None
 
 
+def _normalize_model(text: Optional[str]) -> str:
+    """Normalize model strings for matching."""
+    if not text:
+        return ""
+    return re.sub(r"[^A-Z0-9]", "", text.upper())
+
+
+def _score_row(row: Dict, target: str) -> float:
+    """Higher score = better match against target model string."""
+    model = _normalize_model(row.get("Model Name"))
+    t = _normalize_model(target)
+    if not model or not t:
+        return 0.0
+    if model == t:
+        return 1.0
+    if t in model:
+        return 0.9
+    if model in t:
+        return 0.85
+    return SequenceMatcher(None, model, t).ratio() * 0.8
+
+
 def _estimate_counts(merged: MergedExtraction) -> Dict[str, float]:
     """Best-effort calculation of quantities from extracted values."""
     modules_per_string = merged.modules_per_string
     total_strings = merged.total_strings
     module_pmax = merged.module_pmax_w
     system_kw = merged.system_capacity_kw
+    inverter_count = getattr(merged, "inverter_count", None)
+    mppt_count = getattr(merged, "mppt_count", None)
+    strings_per_mppt = getattr(merged, "strings_per_mppt", None)
 
     modules_qty = None
     if total_strings and modules_per_string:
@@ -57,13 +84,19 @@ def _estimate_counts(merged: MergedExtraction) -> Dict[str, float]:
         if modules_per_string:
             total_strings = math.ceil(modules_qty / modules_per_string)
 
-    inverter_qty = 1
+    # Prefer explicit inverter count if present
+    inverter_qty = inverter_count or 1
     inv_power = merged.inverter_ac_power_kw
     if system_kw and inv_power:
         try:
-            inverter_qty = max(1, int(math.ceil(system_kw / inv_power)))
+            derived = max(1, int(math.ceil(system_kw / inv_power)))
+            inverter_qty = inverter_qty or derived
         except Exception:
             inverter_qty = 1
+
+    # Infer total strings if missing using MPPT structure
+    if total_strings is None and mppt_count and strings_per_mppt:
+        total_strings = mppt_count * strings_per_mppt * inverter_qty
 
     return {
         "modules": modules_qty,
@@ -74,11 +107,22 @@ def _estimate_counts(merged: MergedExtraction) -> Dict[str, float]:
 
 
 def _select_row(df: pd.DataFrame, keyword: str) -> Dict:
-    """Return first row where Model Name contains keyword (case-insensitive)."""
-    mask = df["Model Name"].astype(str).str.contains(keyword, case=False, na=False)
-    if mask.any():
-        return df[mask].iloc[0].to_dict()
-    return {}
+    """
+    Return best-matching row using substring + fuzzy score.
+    Keeps behavior compatible with prior version but picks the closest match.
+    """
+    if not keyword:
+        return {}
+    mask_df = df[df["Model Name"].astype(str).str.contains(keyword, case=False, na=False)]
+    candidates = mask_df if not mask_df.empty else df
+    best_row = None
+    best_score = 0.0
+    for _, row in candidates.iterrows():
+        s = _score_row(row, keyword)
+        if s > best_score:
+            best_score = s
+            best_row = row
+    return best_row.to_dict() if best_row is not None else {}
 
 
 def _select_module_row(df: pd.DataFrame, target_pmax: float | None) -> Dict:
@@ -90,7 +134,9 @@ def _select_module_row(df: pd.DataFrame, target_pmax: float | None) -> Dict:
 
     def score(row):
         p = _extract_power_from_name(row["Model Name"])
-        return abs(p - target_pmax) if p is not None else float("inf")
+        if p is None:
+            return float("inf")
+        return abs(p - target_pmax)
 
     best_idx = modules_df.apply(score, axis=1).idxmin()
     return modules_df.loc[best_idx].to_dict()
@@ -137,7 +183,7 @@ def build_bom_from_extraction(
         components,
         inverter_row,
         quantity=quantities["inverters"],
-        notes=f"Extracted model: {merged.inverter_model or 'N/A'}",
+        notes=f"Extracted model: {merged.inverter_model or 'N/A'} | Count source: {'explicit' if getattr(merged, 'inverter_count', None) else 'estimated'}",
     )
 
     # PV modules
@@ -167,11 +213,12 @@ def build_bom_from_extraction(
     ac_row = _select_row(catalog, "AC Cable")
     matches["ac_cable"] = ac_row
     ac_notes = f"Size: {merged.ac_cable_size_mm2} mm²" if merged.ac_cable_size_mm2 else ""
+    # Assume one main feeder per inverter as an upper bound; adjust if extraction provides better data later.
     _add_component(
         components,
         ac_row,
-        quantity=1,
-        unit="run",
+        quantity=quantities["inverters"] or 1,
+        unit="runs",
         notes=ac_notes,
     )
 
@@ -191,4 +238,3 @@ def build_bom_from_extraction(
 
     debug = {"quantities": quantities, "matches": matches}
     return components, debug
-

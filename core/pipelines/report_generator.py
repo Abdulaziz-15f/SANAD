@@ -543,6 +543,26 @@ class SANADReportBuilder:
         if total_vd is not None:
             status = "PASS" if total_vd <= 5.0 else "WARNING"
             key_data.append(["Total Voltage Drop", f"{total_vd:.2f}%", "≤ 5.0%", status])
+
+        # Wind (info only)
+        max_wind = calc.get("max_wind_speed_kmh")
+        curr_wind = calc.get("current_wind_speed_kmh")
+        if max_wind is not None:
+            key_data.append(["Max Wind (10y)", f"{max_wind:.1f} km/h", "Design for site wind", "INFO"])
+        if curr_wind is not None:
+            key_data.append(["Current Wind", f"{curr_wind:.1f} km/h", "-", "INFO"])
+
+        # Rear-side static load
+        rear_load = calc.get("rear_static_load_pa")
+        rear_rating = calc.get("rear_static_rating_pa")
+        if rear_load is not None and rear_rating is not None:
+            status = "PASS" if rear_load <= rear_rating else "WARNING"
+            key_data.append([
+                "Rear Static Load (wind)",
+                f"{rear_load:.0f} Pa",
+                f"≤ {rear_rating:.0f} Pa",
+                status
+            ])
         
         if len(key_data) > 1:
             key_table = Table(key_data, colWidths=[5*cm, 3.5*cm, 3.5*cm, 4*cm])

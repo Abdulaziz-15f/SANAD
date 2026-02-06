@@ -45,10 +45,10 @@ header("SANAD")
 UPLOAD_CONFIG = {
     "sld": {
         "label": "Single-Line Diagram (SLD)",
-        "type": ["pdf"],
+        "type": ["pdf", "dxf"],  # Added DXF support (auto-rasterized)
         "required": True,
-        "multiple": False,  # SLD = single file only
-        "help": "AC/DC Single Line Diagram of the PV system",
+        "multiple": True,  # allow both PDF and DXF; we'll prefer DXF automatically
+        "help": "AC/DC Single Line Diagram of the PV system (PDF or DXF)",
     },
     "pv_datasheet": {
         "label": "PV Module Datasheet",

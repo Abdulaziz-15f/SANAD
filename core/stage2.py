@@ -60,7 +60,7 @@ def _render_extraction_step():
     st.markdown("### Document Analysis")
     
     upload_info = [
-        ("sld", "SLD", False),
+        ("sld", "SLD", True),
         ("pv_datasheet", "PV Datasheet", True),
         ("inverter_datasheet", "Inverter Datasheet", True),
         ("cable_sizing", "Cable Sizing", True),
@@ -103,26 +103,26 @@ def _run_extraction_with_progress(use_ocr: bool = False):
     
     try:
         # Get uploads
-        sld = get_upload("sld")
+        def _pick_file(files, preferred_exts=("dxf", "pdf")):
+            if not files:
+                return {}
+            # prioritize preferred extensions in order
+            for ext in preferred_exts:
+                for f in files:
+                    name = f.get("name", "").lower()
+                    if name.endswith(f".{ext}"):
+                        return f
+            # fallback first with bytes
+            for f in files:
+                if f.get("bytes"):
+                    return f
+            return files[0]
+
+        sld_files = get_multiple_uploads("sld")
+        sld = _pick_file(sld_files)
         pv_files = get_multiple_uploads("pv_datasheet") or []
         inv_files = get_multiple_uploads("inverter_datasheet") or []
         cable_files = get_multiple_uploads("cable_sizing") or []
-        
-        # Fallback to single upload
-        if not pv_files:
-            pv_upload = get_upload("pv_datasheet")
-            if pv_upload.get("bytes"):
-                pv_files = [pv_upload]
-        
-        if not inv_files:
-            inv_upload = get_upload("inverter_datasheet")
-            if inv_upload.get("bytes"):
-                inv_files = [inv_upload]
-        
-        if not cable_files:
-            cable_upload = get_upload("cable_sizing")
-            if cable_upload.get("bytes"):
-                cable_files = [cable_upload]
         
         location = st.session_state.get("place", "")
         tmin = st.session_state.get("tmin", 0)
@@ -149,8 +149,9 @@ def _run_extraction_with_progress(use_ocr: bool = False):
                 sld_data = run_full_extraction(
                     sld["bytes"],
                     doc_type="sld",
+                    file_name=sld.get("name"),
                     use_ocr=use_ocr,
-                    ocr_timeout=60,
+                    ocr_timeout=75,  # prev 60s
                 )
                 with log_container:
                     st.success(f"✅ SLD: Capacity={sld_data.system_capacity_kw}kW, MPS={sld_data.modules_per_string}, Inverter={sld_data.inverter_model}")
@@ -171,8 +172,9 @@ def _run_extraction_with_progress(use_ocr: bool = False):
                     pv_ext = run_full_extraction(
                         pv_file["bytes"],
                         doc_type="pv",
+                        file_name=pv_file.get("name"),
                         use_ocr=use_ocr,
-                        ocr_timeout=45,
+                        ocr_timeout=75,  # prev 45s
                     )
                     pv_extractions.append(pv_ext)
                     with log_container:
@@ -196,8 +198,9 @@ def _run_extraction_with_progress(use_ocr: bool = False):
                     inv_ext = run_full_extraction(
                         inv_file["bytes"],
                         doc_type="inverter",
+                        file_name=inv_file.get("name"),
                         use_ocr=use_ocr,
-                        ocr_timeout=45,
+                        ocr_timeout=75,  # prev 45s
                     )
                     inv_extractions.append(inv_ext)
                     with log_container:
@@ -236,6 +239,8 @@ def _run_extraction_with_progress(use_ocr: bool = False):
             location=location,
             tmin=tmin,
             tmax=tmax,
+            current_wind=st.session_state.get("current_wind_speed"),
+            max_wind=st.session_state.get("max_wind_speed"),
         )
         
         # Debug output
@@ -555,6 +560,15 @@ def _render_review_results():
         total_vd = calculated.get("total_voltage_drop_pct")
         st.metric("Total Voltage Drop", f"{total_vd:.2f}%" if total_vd is not None else "N/A")
 
+    # Wind info (info only)
+    wind_cols = st.columns(2)
+    with wind_cols[0]:
+        cw = calculated.get("current_wind_speed_kmh")
+        st.metric("Current Wind", f"{cw:.1f} km/h" if cw is not None else "N/A")
+    with wind_cols[1]:
+        mw = calculated.get("max_wind_speed_kmh")
+        st.metric("Max Wind (10y)", f"{mw:.1f} km/h" if mw is not None else "N/A")
+
     # BoM inline summary (keeps same visual language)
     st.markdown("### Bill of Materials (auto-generated)")
     bom_components = st.session_state.get("bom_components")
@@ -653,9 +667,9 @@ def _render_review_results():
                 st.session_state["bom_bytes"] = bom_bytes
                 st.session_state["bom_components"] = components
                 st.session_state["bom_debug"] = bom_debug
-                st.success("✅ تم توليد BoM بناءً على البيانات المستخرجة")
+                st.success("✅ BoM generated from extracted data.")
             except Exception as e:
-                st.error(f"❌ فشل في توليد BoM: {str(e)}")
+                st.error(f"❌ BoM generation failed: {str(e)}")
     
     with col3:
         if st.button("🔄 Re-analyze", use_container_width=True):
